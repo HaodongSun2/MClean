@@ -4,7 +4,7 @@ MClean v2.2 — Classic Win9x Retro  |  Haodong Sun
 import os, sys, subprocess, threading, tkinter as tk
 from tkinter import ttk, messagebox
 from pathlib import Path
-import platform, winreg
+import platform, winreg, json, re
 
 # ── Palette ─────────────────────────────────────────
 C_FACE = "#D4D0C8"; C_HIGHLIGHT = "#FFFFFF"; C_SHADOW = "#808080"
@@ -100,13 +100,17 @@ STRINGS = {
 
 def _get_windows_version():
     ver = sys.getwindowsversion()
-    m = {10240:"1507",10586:"1511",14393:"1607",15063:"1703",16299:"1709",
-         17134:"1803",17763:"1809",18362:"1903",18363:"1909",19041:"2004",
-         19042:"20H2",19043:"21H1",19044:"21H2",19045:"22H2",22000:"21H2",
-         22621:"22H2",22631:"23H2",26100:"24H2",26200:"24H2"}
-    r = m.get(ver.build, f"Build {ver.build}")
-    e = {2:"Home",48:"Pro",125:"Education",4:"Enterprise"}
-    return f"Windows {ver.major}.{ver.minor} {r} ({e.get(ver.product_type,'')})  Build {ver.build}"
+    m10 = {10240:"1507",10586:"1511",14393:"1607",15063:"1703",16299:"1709",
+           17134:"1803",17763:"1809",18362:"1903",18363:"1909",19041:"2004",
+           19042:"20H2",19043:"21H1",19044:"21H2",19045:"22H2"}
+    m11 = {22000:"21H2",22621:"22H2",22631:"23H2",
+           26100:"24H2",26120:"24H2",26200:"24H2"}
+    win_name = "Windows 11" if ver.build >= 22000 else f"Windows {ver.major}"
+    r = m11.get(ver.build) if ver.build >= 22000 else m10.get(ver.build)
+    if not r: r = f"Build {ver.build}"
+    e = {2:"Home",48:"Pro",125:"Education",4:"Enterprise",101:"Home Single Language"}
+    edition = e.get(ver.product_type,'')
+    return f"{win_name} {r} ({edition})" if edition else f"{win_name} {r}"
 
 
 def get_system_info(tr):
@@ -155,6 +159,68 @@ def _read_uninstall_key(root, path, arch=""):
     except OSError: pass
     return out
 
+def _scan_store_apps():
+    """Scan Store/AppX/MSIX packages via winget (no elevation needed)."""
+    try:
+        result = subprocess.run(
+            ["winget","list"],
+            capture_output=True,text=True,timeout=30,encoding="utf-8",errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW)
+        if result.returncode!=0 or not result.stdout.strip():
+            return []
+        lines = result.stdout.splitlines()
+        out = []
+        header_found = False
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("-"):
+                continue
+            if not header_found:
+                if "Name" in line and "Id" in line:
+                    header_found = True
+                continue
+            # winget uses 2+ spaces to separate columns
+            cols = re.split(r' {2,}', line)
+            if len(cols) < 2:
+                continue
+            name = cols[0].strip()
+            raw_id = cols[1].strip() if len(cols) > 1 else ""
+            version = cols[2].strip() if len(cols) > 2 else ""
+            # available = cols[3].strip() if len(cols) > 3 else ""
+            source = cols[-1].strip() if len(cols) > 3 else ""
+            if not name or not raw_id:
+                continue
+            # Only include Store, MSIX and AppX packages (not ARP or pure winget)
+            id_upper = raw_id.upper()
+            is_store = any(tag in id_upper for tag in ["MSIX\\", "MSSTORE", "8WEKYB3D8BBWE", 
+                           ".APPX", "APPX\\", "MICROSOFT."])
+            # Also include Windows Store apps identified by source
+            is_store = is_store or source.lower() == "msstore" or source.lower() == "winget"
+            if not is_store:
+                continue
+            # Determine uninstall method
+            uninstall_cmd = ""
+            tag = "Store"
+            if "MSIX\\" in id_upper or "APPX\\" in id_upper or "8WEKYB3D8BBWE" in id_upper:
+                # MSIX/AppX - use winget with name (ID contains MSIX path, not winget ID)
+                uninstall_cmd = f'winget uninstall --name "{name}"'
+                tag = "AppX/MSIX"
+            elif source.lower() == "msstore":
+                uninstall_cmd = f'winget uninstall --id {raw_id} --source msstore'
+                tag = "Store"
+            elif source.lower() == "winget":
+                uninstall_cmd = f'winget uninstall --id {raw_id} --source winget'
+                tag = "Winget"
+            out.append({"name":name,"version":version,
+                         "publisher":source or "Microsoft Store",
+                         "size_kb":0,
+                         "uninstall_string":uninstall_cmd,
+                         "arch":tag,
+                         "store_id":raw_id})
+        return out
+    except Exception:
+        return []
+
 def scan_installed_software(cb=None):
     roots = [
         (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall","64-bit"),
@@ -165,6 +231,8 @@ def scan_installed_software(cb=None):
     for root,path,tag in roots:
         if cb: cb(f"Scanning {tag}...")
         items.extend(_read_uninstall_key(root,path,tag))
+    if cb: cb("Scanning Microsoft Store...")
+    items.extend(_scan_store_apps())
     return items
 
 def uninstall_software(item, tr):
